@@ -84,6 +84,12 @@ final_features = selector.feature_ranking(features_distilled, n_features=30, out
 print(f"Selected {len(final_features)} features")
 ```
 
+Target files use the `residuals` column when present, or the only data column
+when there is exactly one. For other multi-column target files, specify the
+column explicitly with `selector.load_data(..., target_column='trait')` or
+`rgb-feature-select --target_column trait ...`. Ambiguous targets and missing
+explicitly requested columns raise an error.
+
 ### 3. Model Training and Evaluation
 
 ```python
@@ -254,6 +260,15 @@ Configuration can be provided via JSON file or programmatically:
 ```
 
 See [configs/config.json](configs/config.json) for the complete default configuration.
+
+`model_params.importance_type` applies to pooling, distillation, refinement,
+and ranking. It defaults to `shap`; `gain` uses total split gain and `split`
+uses split counts from LightGBM. Unknown values raise an error. These methods
+can produce different feature rankings.
+
+Parquet loading uses `pyarrow>=10.0.1` ([Parquet reader API](https://arrow.apache.org/docs/10.0/python/generated/pyarrow.parquet.ParquetFile.html)). If reading fails specifically because
+Thrift metadata exceeds its size limit, RGB retries with string and container
+limits of 1000 MiB. Other read errors propagate without a retry.
 
 ## Examples
 

@@ -24,6 +24,7 @@ import os
 import json
 import warnings
 import time
+from rgb.utils import load_feature_data, load_target_data
 
 # Suppress warnings for cleaner output
 warnings.filterwarnings('ignore')
@@ -140,7 +141,8 @@ class RefinedGradientBoosting:
     
     def load_data(self, X_path: str, y_path: str, 
                   training_samples_path: Optional[str] = None,
-                  taxonomy_filter: Optional[Dict] = None) -> None:
+                  taxonomy_filter: Optional[Dict] = None,
+                  target_column: Optional[str] = None) -> None:
         """
         Load and prepare data for feature selection
         
@@ -149,19 +151,15 @@ class RefinedGradientBoosting:
             y_path: Path to target variable data
             training_samples_path: Optional path to training samples
             taxonomy_filter: Optional dictionary for filtering taxonomy
+            target_column: Target column; otherwise use residuals or the only column
         """
         logger.info("Loading data...")
         
         # Load feature data
-        if X_path.endswith('.parquet'):
-            self.X_all = pd.read_parquet(X_path)
-        else:
-            self.X_all = pd.read_csv(X_path, index_col=0)
+        self.X_all = load_feature_data(X_path)
         
         # Load target data
-        self.y_all = pd.read_csv(y_path, index_col=0)
-        if 'residuals' in self.y_all.columns:
-            self.y_all = self.y_all['residuals']
+        self.y_all = load_target_data(y_path, target_column=target_column)
         
         # Apply taxonomy filter if provided
         if taxonomy_filter:
@@ -200,7 +198,7 @@ class RefinedGradientBoosting:
         random_state = self.config.get('model_params', 'random_state', 42)
         
         training_indices, _ = train_test_split(
-            self.X_all.index, 
+            list(self.X_all.index),
             test_size=test_size, 
             random_state=random_state
         )
@@ -230,8 +228,12 @@ class RefinedGradientBoosting:
     
     def _compute_feature_importance(self, model, X: pd.DataFrame,
                                   cor_test: float,
-                                  importance_type: str = 'shap') -> pd.DataFrame:
-        """Compute feature importance using SHAP or built-in importance"""
+                                  importance_type: Optional[str] = None) -> pd.DataFrame:
+        """Compute configured SHAP, gain, or split importance, defaulting to SHAP."""
+        if importance_type is None:
+            importance_type = self.config.get('model_params', 'importance_type', 'shap')
+        if importance_type not in ('shap', 'gain', 'split'):
+            raise ValueError(f"Unsupported importance_type {importance_type!r}; expected shap, gain, or split")
         feature_names = X.columns
 
         if importance_type == 'shap':
@@ -249,7 +251,7 @@ class RefinedGradientBoosting:
         else:
             importance_df = pd.DataFrame({
                 'feature': feature_names,
-                'importance': cor_test * model.feature_importances_
+                'importance': cor_test * model.booster_.feature_importance(importance_type=importance_type)
             })
 
         return importance_df.sort_values('importance', ascending=False)
@@ -350,10 +352,11 @@ class RefinedGradientBoosting:
         pooling_config = self.config.get_section('feature_pooling')
         step = pooling_config.get('step', 80)
         max_features = pooling_config.get('max_features', 10000)
+        max_possible = min(max_features, self.X_train.shape[1])
         importance_type = self.config.get('model_params', 'importance_type', 'shap')
 
         i = 0
-        while len(self.feature_pool) < max_features:
+        while len(self.feature_pool) < max_possible:
             logger.info(f"\n[Iteration {i}] Feature pool: {len(self.feature_pool)} features")
 
             summary_importance, accuracy_metrics = self._run_pooling_iteration(i, pooling_config, importance_type)
@@ -407,8 +410,15 @@ class RefinedGradientBoosting:
         valid_models = 0
 
         while j < n_iter:
+            if len(self.feature_pool) >= self.X_train.shape[1]:
+                logger.info("No remaining features to pool, stopping iteration.")
+                break
+
             # Create feature subset
             X_sub = self._create_feature_subset()
+            if X_sub is None or X_sub.shape[1] == 0:
+                logger.info("Feature subset is empty, stopping iteration.")
+                break
 
             # Train and evaluate model
             model, results = self._train_and_evaluate(
@@ -472,9 +482,9 @@ class RefinedGradientBoosting:
                 n_estimators_multiplier=1  # Use same number of trees as regular training
             )
 
-            # Compute SHAP importance
+            # Compute configured feature importance
             importance_df = self._compute_feature_importance(
-                model, X_sub, results['cor_val'], 'shap'
+                model, X_sub, results['cor_val']
             )
 
             # Add to summary
@@ -597,6 +607,7 @@ class RefinedGradientBoosting:
         accuracy_metrics = []
 
         n_iter = distillation_config.get('n_iter', 100)
+        summary_importance = pd.DataFrame()
         correlation_threshold = distillation_config.get('correlation_threshold', 0.05)
 
         # Use the restricted training set from distillation (only pooling features)
@@ -611,6 +622,10 @@ class RefinedGradientBoosting:
                 X_sub = X_train_base.drop(dropped_col, axis=1)
             else:
                 X_sub = X_train_base.copy()
+
+            if X_sub.shape[1] == 0:
+                logger.info("Feature subset is empty in distillation, stopping.")
+                break
 
             # Initialize summary for this X_sub's columns
             if j == 0:
@@ -661,7 +676,7 @@ class RefinedGradientBoosting:
             )
 
             importance_df = self._compute_feature_importance(
-                model, X_sub, results['cor_val'], 'shap'
+                model, X_sub, results['cor_val']
             )
 
             col_name = f'distill_refine_{q}'
@@ -779,9 +794,9 @@ class RefinedGradientBoosting:
                 X_sub, self.y_train, self.X_test[features], self.y_test
             )
             
-            # Compute SHAP importance
+            # Compute configured feature importance
             importance_df = self._compute_feature_importance(
-                model, X_sub, results['cor_val'], 'shap'
+                model, X_sub, results['cor_val']
             )
             
             col_name = f'ranking_vals_{j}'
@@ -888,6 +903,7 @@ def main():
     # Data parameters
     parser.add_argument('--X_path', type=str, required=True, help='Path to feature data')
     parser.add_argument('--y_path', type=str, required=True, help='Path to target data')
+    parser.add_argument('--target_column', type=str, help='Target column (default: residuals or the only column)')
     parser.add_argument('--training_samples', type=str, help='Path to training samples')
     parser.add_argument('--output_dir', type=str, default='./results', help='Output directory')
     
@@ -927,7 +943,8 @@ def main():
         X_path=args.X_path,
         y_path=args.y_path,
         training_samples_path=args.training_samples,
-        taxonomy_filter=taxonomy_filter
+        taxonomy_filter=taxonomy_filter,
+        target_column=args.target_column
     )
     
     # Run selected stages

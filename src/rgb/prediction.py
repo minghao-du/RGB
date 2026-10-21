@@ -24,6 +24,7 @@ import logging
 import json
 from pathlib import Path
 import warnings
+from rgb.utils import load_feature_data
 
 warnings.filterwarnings('ignore')
 
@@ -120,10 +121,7 @@ class RGBPredictor:
         # Load X
         if isinstance(X, (str, Path)):
             X_path = Path(X)
-            if X_path.suffix in ['.parquet', '.parq']:
-                X = pd.read_parquet(X_path)
-            else:
-                X = pd.read_csv(X_path, index_col=0)
+            X = load_feature_data(X_path)
             logger.info(f"Loaded X from {X_path}: {X.shape}")
 
         # Load y

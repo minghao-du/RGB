@@ -47,7 +47,25 @@ def load_feature_data(
     logger.info(f"Loading feature data from {file_path}")
 
     if file_path.suffix in ['.parquet', '.parq']:
-        df = pd.read_parquet(file_path)
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        try:
+            df = pd.read_parquet(file_path, engine='pyarrow')
+        except (pa.ArrowInvalid, OSError) as error:
+            message = str(error).lower()
+            if 'thrift' not in message or 'exceeded size limit' not in message:
+                raise
+            logger.warning("Parquet Thrift metadata limit exceeded; retrying with 1000 MiB limits")
+            parquet_file = pq.ParquetFile(
+                file_path,
+                thrift_string_size_limit=1000 * 1024 * 1024,
+                thrift_container_size_limit=1000 * 1024 * 1024,
+            )
+            try:
+                df = parquet_file.read().to_pandas()
+            finally:
+                parquet_file.close()
     elif file_path.suffix == '.csv':
         df = pd.read_csv(file_path, index_col=index_col)
     else:
@@ -59,7 +77,7 @@ def load_feature_data(
 
 def load_target_data(
     file_path: Union[str, Path],
-    target_column: Optional[str] = 'residuals',
+    target_column: Optional[str] = None,
     index_col: Optional[int] = 0
 ) -> pd.Series:
     """
@@ -67,7 +85,7 @@ def load_target_data(
 
     Args:
         file_path: Path to the target data file
-        target_column: Name of the target column (default: 'residuals')
+        target_column: Explicit target column, or auto-select residuals/the only column
         index_col: Column to use as index (default: 0)
 
     Returns:
@@ -75,6 +93,7 @@ def load_target_data(
 
     Raises:
         FileNotFoundError: If file does not exist
+        ValueError: If the target column is missing or ambiguous
     """
     file_path = Path(file_path)
 
@@ -85,13 +104,19 @@ def load_target_data(
 
     df = pd.read_csv(file_path, index_col=index_col)
 
-    # Extract target column if it exists
-    if target_column and target_column in df.columns:
+    if target_column is not None:
+        if target_column not in df.columns:
+            raise ValueError(f"Requested target_column {target_column!r} not found in {list(df.columns)}")
         data = df[target_column]
+    elif 'residuals' in df.columns:
+        data = df['residuals']
     elif len(df.columns) == 1:
         data = df.iloc[:, 0]
     else:
-        data = df
+        raise ValueError(
+            f"Expected one target column or a 'residuals' column; found {list(df.columns)}. "
+            "Specify target_column explicitly."
+        )
 
     logger.info(f"Loaded target with {len(data)} samples")
     return data
